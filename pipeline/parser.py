@@ -17,8 +17,13 @@ Each CSI packet is one CSV line:
   (see ESP-IDF wifi_csi_info_t docs; the tool itself computes
   amplitude = sqrt(buf[2i]^2 + buf[2i+1]^2) and
   phase = atan2(buf[2i], buf[2i+1])).
-- len is the byte length of the buffer (e.g. 384 -> 192 complex slots
-  covering LLTF + HT-LTF + STBC-HT-LTF; 128 -> 64 LLTF-only slots).
+- len is data->len, the FULL CSI buffer size (e.g. 384). IMPORTANT: with
+  CONFIG_SHOULD_COLLECT_ONLY_LLTF (the tool default) the firmware prints
+  only the first 128 int8 values (64 LLTF subcarriers) even though len still
+  says 384. Confirmed against the vendored example_csi.csv (len=384, 128
+  values printed). The parser therefore treats len as advisory and decodes
+  whatever count is actually printed. buf_len = printed count,
+  advertised_len = the len field.
 - local_timestamp is the ESP32 microsecond clock; real_timestamp is
   the tool's steady-clock seconds (float), only meaningful once time
   is set on the device.
@@ -64,7 +69,8 @@ class CSIFrame:
     local_timestamp_us: int
     real_timestamp: float
     sig_len: int
-    buf_len: int
+    buf_len: int          # number of int8 values ACTUALLY printed in this line
+    advertised_len: int   # the `len` metadata field (full buffer size; advisory)
     csi: np.ndarray = field(repr=False)  # complex64, one value per subcarrier slot
 
     @property
@@ -117,15 +123,17 @@ def parse_csi_line(line: str) -> CSIFrame:
         raise CSIParseError(f"Non-integer value in CSI buffer: {exc}") from exc
 
     try:
-        buf_len = int(meta[24])
-        expected = buf_len
+        advertised_len = int(meta[24])
+        # IMPORTANT (confirmed against the vendored example_csi.csv): the `len`
+        # metadata field is data->len (the FULL CSI buffer size, e.g. 384), but
+        # with CONFIG_SHOULD_COLLECT_ONLY_LLTF (the default) the firmware prints
+        # only the first 128 int8 values. So the printed count legitimately
+        # differs from `len`. We therefore treat `len` as advisory and validate
+        # only what actually matters for decoding: a non-empty, EVEN-length
+        # integer buffer. (Truncated serial lines are caught by the missing-`]`
+        # and non-integer checks above, and by requiring even length here.)
         if raw.size % 2 != 0:
             raise CSIParseError(f"Odd CSI buffer length {raw.size}")
-        if raw.size != expected:
-            # Truncated / garbled serial line: reject rather than guess.
-            raise CSIParseError(
-                f"Buffer length mismatch: header says {expected}, got {raw.size}"
-            )
         raw = raw.astype(np.float32)
         # ESP-IDF layout: [imag, real] per subcarrier slot.
         imag = raw[0::2]
@@ -141,7 +149,8 @@ def parse_csi_line(line: str) -> CSIFrame:
             local_timestamp_us=int(meta[18]),
             real_timestamp=float(meta[23]),
             sig_len=int(meta[20]),
-            buf_len=buf_len,
+            buf_len=int(raw.size),
+            advertised_len=advertised_len,
             csi=csi,
         )
     except CSIParseError:
