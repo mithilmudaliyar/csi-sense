@@ -5,9 +5,11 @@ SessionWriter, so the output files are byte-identical in shape to what live
 hardware capture will produce (same columns, same .meta.json sidecar).
 
 Run:
-    py -m ml.generate_synthetic                  # all 4 scenarios, 20s each
+    py -m ml.generate_synthetic                  # all 5 scenarios, 20s each
     py -m ml.generate_synthetic --duration 10    # shorter
     py -m ml.generate_synthetic --scenario fall
+    py -m ml.generate_synthetic --scenario still_vitals --duration 30
+                                    # EXPERIMENTAL vitals scenario (Phase-5)
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from ml.synthetic import SCENARIOS, generate_session
+from ml.synthetic import ALL_SCENARIOS, generate_session
 from pipeline.parser import parse_csi_line
 from pipeline.storage import SessionWriter
 
@@ -31,6 +33,9 @@ def write_scenario(scenario: str, out_dir: Path, duration_s: float, sr: float, s
         notes=f"Synthetic {scenario} session (seed={seed}). NOT real capture.",
         source="synthetic",
         sample_rate_hz_nominal=sr,
+        # Known synthetic ground truth (e.g. still_vitals rates) rides in the
+        # sidecar so ml/vitals.py can report recovered-vs-true BPM.
+        extra={"ground_truth": sess.ground_truth} if sess.ground_truth else None,
     )
     for i, line in enumerate(sess.lines):
         frame = parse_csi_line(line)
@@ -42,7 +47,7 @@ def write_scenario(scenario: str, out_dir: Path, duration_s: float, sr: float, s
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Generate synthetic CSI sessions to disk.")
-    ap.add_argument("--scenario", choices=SCENARIOS, help="only this scenario (default: all)")
+    ap.add_argument("--scenario", choices=ALL_SCENARIOS, help="only this scenario (default: all)")
     ap.add_argument("--duration", type=float, default=20.0, help="seconds per session")
     ap.add_argument("--rate", type=float, default=50.0, help="nominal sample rate Hz")
     ap.add_argument("--out", default=str(DEFAULT_OUT), help="output directory")
@@ -50,7 +55,7 @@ def main() -> int:
     args = ap.parse_args()
 
     out_dir = Path(args.out)
-    scenarios = [args.scenario] if args.scenario else list(SCENARIOS)
+    scenarios = [args.scenario] if args.scenario else list(ALL_SCENARIOS)
     written = []
     for i, sc in enumerate(scenarios):
         path = write_scenario(sc, out_dir, args.duration, args.rate, args.seed + i)

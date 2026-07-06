@@ -35,11 +35,16 @@ BUF_LEN = N_SUBCARRIERS * 2  # int8 count reported in the `len` field
 NULL_SUBCARRIERS = tuple([0, 1, 2, 3, 4, 5, 31, 32, 59, 60, 61, 62, 63])
 
 SCENARIOS = ("empty", "walking", "fall", "2people")
+# EXPERIMENTAL vitals scenario (Phase-5). Kept OUT of SCENARIOS on purpose:
+# the classifier dataset builders iterate SCENARIOS and must not train on it.
+VITALS_SCENARIO = "still_vitals"
+ALL_SCENARIOS = SCENARIOS + (VITALS_SCENARIO,)
 SCENARIO_TO_LABEL = {
     "empty": "empty",
     "walking": "walking",
     "fall": "fall",
     "2people": "2people",
+    VITALS_SCENARIO: VITALS_SCENARIO,
 }
 
 DEFAULT_SAMPLE_RATE_HZ = 50.0
@@ -53,6 +58,9 @@ class SyntheticSession:
     amplitude: np.ndarray  # (n_samples, n_subcarriers), pre-quantization "truth"
     lines: list[str]       # raw ESP32-CSI-Tool serial lines
     sample_rate_hz: float
+    # Known synthetic ground truth (e.g. vitals rates). None for scenarios
+    # without one. SYNTHETIC ONLY — proves the DSP code, not real accuracy.
+    ground_truth: dict | None = None
 
 
 def _baseline_profile(rng: np.random.Generator) -> np.ndarray:
@@ -136,6 +144,59 @@ def _two_people(n: int, rng: np.random.Generator, base: np.ndarray, sr: float) -
     return amp
 
 
+def _still_vitals(
+    n: int, rng: np.random.Generator, base: np.ndarray, sr: float,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Near-still subject with breathing + heartbeat micro-modulation.
+
+    EXPERIMENTAL / SYNTHETIC ONLY: a near-still baseline plus a small
+    periodic PHASE oscillation at a breathing rate (~0.2-0.3 Hz) and a
+    smaller one at a heart rate (~1.0-1.4 Hz), with matching faint
+    amplitude ripples. Exists so ml/vitals.py can recover KNOWN rates and
+    prove the bandpass DSP works — it says nothing about real-world
+    feasibility on ESP32 phase noise.
+
+    Returns (amplitude, phase_timeseries, ground_truth).
+    """
+    t = np.arange(n) / sr
+    breathing_hz = float(rng.uniform(0.2, 0.3))
+    heart_hz = float(rng.uniform(1.0, 1.4))
+
+    # Chest motion perturbs subcarriers coherently with varying gains.
+    sub_gain = rng.uniform(0.5, 1.0, size=N_SUBCARRIERS)
+    breathing_wave = np.sin(2 * np.pi * breathing_hz * t)[:, None]
+    heart_wave = np.sin(2 * np.pi * heart_hz * t)[:, None]
+
+    # Phase modulation (radians): breathing dominant, heartbeat much smaller.
+    base_phase = rng.uniform(-np.pi, np.pi, size=N_SUBCARRIERS)
+    phase_ts = (
+        base_phase[None, :]
+        + 0.25 * breathing_wave * sub_gain[None, :]
+        + 0.08 * heart_wave * sub_gain[None, :]
+        + rng.normal(0.0, 0.01, size=(n, N_SUBCARRIERS))
+    )
+
+    # Faint matching amplitude ripple + near-still noise floor.
+    amp = (
+        base[None, :]
+        + 1.2 * breathing_wave * sub_gain[None, :]
+        + 0.4 * heart_wave * sub_gain[None, :]
+        + rng.normal(0.0, 0.3, size=(n, N_SUBCARRIERS))
+    )
+    for k in NULL_SUBCARRIERS:
+        amp[:, k] = 0.0
+        phase_ts[:, k] = 0.0
+
+    ground_truth = {
+        "breathing_hz": breathing_hz,
+        "breathing_bpm": breathing_hz * 60.0,
+        "heart_hz": heart_hz,
+        "heart_bpm": heart_hz * 60.0,
+        "note": "SYNTHETIC ground truth — validates DSP code only.",
+    }
+    return amp, phase_ts, ground_truth
+
+
 _GENERATORS = {
     "empty": lambda n, rng, base, sr: _empty(n, rng, base),
     "walking": lambda n, rng, base, sr: _walking(n, rng, base, sr),
@@ -147,19 +208,25 @@ _GENERATORS = {
 def _amplitude_to_lines(
     amp: np.ndarray, rng: np.random.Generator, role: str = "STA",
     mac: str = "AA:BB:CC:DD:EE:FF", channel: int = 6,
+    phase_ts: np.ndarray | None = None,
 ) -> list[str]:
     """Quantize an amplitude matrix into ESP32-CSI-Tool-format serial lines.
 
     We synthesize a plausible phase per subcarrier, convert to real/imag,
     clip to int8, and lay them out as [imag, real] pairs exactly like the
     firmware's raw buffer so pipeline.parser handles them unmodified.
+
+    ``phase_ts`` (n_samples, n_subcarriers) optionally supplies a per-sample
+    phase (used by the still_vitals scenario, whose signal lives in phase);
+    when None a static random per-subcarrier phase is used as before.
     """
     n = amp.shape[0]
     lines: list[str] = []
-    phase = rng.uniform(-np.pi, np.pi, size=amp.shape[1])
+    static_phase = rng.uniform(-np.pi, np.pi, size=amp.shape[1])
     local_ts = int(rng.integers(1_000_000, 5_000_000))
     for i in range(n):
         a = amp[i]
+        phase = static_phase if phase_ts is None else phase_ts[i]
         real = np.clip(a * np.cos(phase), -_INT8_CLIP, _INT8_CLIP).astype(int)
         imag = np.clip(a * np.sin(phase), -_INT8_CLIP, _INT8_CLIP).astype(int)
         buf = np.empty(amp.shape[1] * 2, dtype=int)
@@ -184,18 +251,85 @@ def generate_session(
     node_id: str = "node1",
 ) -> SyntheticSession:
     """Generate one synthetic session for a scenario."""
-    if scenario not in _GENERATORS:
-        raise ValueError(f"Unknown scenario {scenario!r}; choose from {SCENARIOS}")
+    if scenario not in ALL_SCENARIOS:
+        raise ValueError(f"Unknown scenario {scenario!r}; choose from {ALL_SCENARIOS}")
     rng = np.random.default_rng(seed)
     n = max(4, int(round(duration_s * sample_rate_hz)))
     base = _baseline_profile(rng)
-    amp = _GENERATORS[scenario](n, rng, base, sample_rate_hz)
+
+    phase_ts: np.ndarray | None = None
+    ground_truth: dict | None = None
+    if scenario == VITALS_SCENARIO:
+        amp, phase_ts, ground_truth = _still_vitals(n, rng, base, sample_rate_hz)
+    else:
+        amp = _GENERATORS[scenario](n, rng, base, sample_rate_hz)
+
     amp = np.clip(amp, 0.0, _INT8_CLIP)
-    lines = _amplitude_to_lines(amp, rng)
+    lines = _amplitude_to_lines(amp, rng, phase_ts=phase_ts)
     return SyntheticSession(
         scenario=scenario,
         label=SCENARIO_TO_LABEL[scenario],
         amplitude=amp.astype(np.float32),
         lines=lines,
         sample_rate_hz=sample_rate_hz,
+        ground_truth=ground_truth,
     )
+
+
+# Disturbance gain seen by the NON-active node in a two-node synthetic scene.
+# < 1.0 so the node nearer the activity clearly reads a stronger intensity.
+FAR_NODE_GAIN = 0.45
+# Samples the far node's disturbance is delayed by (correlated-but-offset).
+FAR_NODE_LAG_SAMPLES = 4
+
+
+def generate_two_node_session(
+    scenario: str,
+    duration_s: float = 20.0,
+    sample_rate_hz: float = DEFAULT_SAMPLE_RATE_HZ,
+    seed: int | None = None,
+    active_node: str = "node1",
+    nodes: tuple[str, str] = ("node1", "node2"),
+) -> dict[str, SyntheticSession]:
+    """Two correlated-but-offset synthetic RX views of ONE scene.
+
+    SYNTHETIC ONLY — exists so the dashboard's per-node motion-intensity
+    meters and the EXPERIMENTAL coarse-zone widget are demonstrable before
+    hardware. Both nodes see the same disturbance; ``active_node`` sees it
+    at full strength, the other attenuated (FAR_NODE_GAIN) and slightly
+    delayed. That models "activity is stronger NEAR one node" — an
+    intensity contrast, not a position.
+    """
+    if active_node not in nodes:
+        raise ValueError(f"active_node {active_node!r} must be one of {nodes}")
+    rng = np.random.default_rng(seed)
+    n = max(4, int(round(duration_s * sample_rate_hz)))
+
+    # One shared scene disturbance...
+    scene_base = _baseline_profile(rng)
+    scene_amp = _GENERATORS[scenario](n, rng, scene_base, sample_rate_hz) \
+        if scenario in _GENERATORS else None
+    if scene_amp is None:
+        raise ValueError(f"Unknown scenario {scenario!r}; choose from {SCENARIOS}")
+    disturbance = scene_amp - scene_base[None, :]
+
+    sessions: dict[str, SyntheticSession] = {}
+    for node in nodes:
+        node_base = _baseline_profile(rng)  # each RX has its own multipath
+        if node == active_node:
+            d = disturbance
+        else:
+            d = FAR_NODE_GAIN * np.roll(disturbance, FAR_NODE_LAG_SAMPLES, axis=0)
+        amp = node_base[None, :] + d + rng.normal(0.0, 0.4, size=disturbance.shape)
+        for k in NULL_SUBCARRIERS:
+            amp[:, k] = rng.normal(0.0, 0.4, size=n)
+        amp = np.clip(amp, 0.0, _INT8_CLIP)
+        sessions[node] = SyntheticSession(
+            scenario=scenario,
+            label=SCENARIO_TO_LABEL[scenario],
+            amplitude=amp.astype(np.float32),
+            lines=_amplitude_to_lines(amp, rng),
+            sample_rate_hz=sample_rate_hz,
+            ground_truth={"active_node": active_node, "synthetic_two_node": True},
+        )
+    return sessions

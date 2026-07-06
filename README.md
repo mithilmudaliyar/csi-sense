@@ -1,9 +1,14 @@
-# wifiscan — WiFi CSI Human Sensing
+# csi-sense — WiFi CSI Human Sensing
 
 Device-free **presence**, **fall**, and **people-counting (0/1/2)** using WiFi
 Channel State Information (CSI) from cheap **ESP32-WROOM-32** boards. No
 cameras, no wearables. College hobby project — honestly scoped (see
 [`docs/limitations.md`](docs/limitations.md)).
+
+Plus an **experimental Phase-5** layer: coarse per-node **motion intensity**
+and **breathing / heart-rate** estimation from a still subject. Both are
+unvalidated on real hardware and built to **refuse rather than guess** — see
+[Experimental: vitals + motion](#experimental-phase-5--vitals--motion) below.
 
 The full software stack runs **today on synthetic data**. When the 3 ESP32
 boards arrive you only flash them and start capturing — the same pipeline
@@ -18,12 +23,12 @@ ESP32 RX ──serial──► parse ──► preprocess ──► features ─
 
 ```
 firmware/     vendored ESP32-CSI-Tool (Hernandez) + platformio.ini
-pipeline/     serial reader, parser, preprocess, features, storage, CLIs
-ml/           synthetic generator, dataset builder, 3 classifiers, train/eval
-dashboard/    Streamlit app (synthetic / recorded / live serial)
+pipeline/     serial reader, parser, preprocess, features, storage, motion, CLIs
+ml/           synthetic generator, dataset builder, 3 classifiers, vitals, train/eval
+dashboard/    Streamlit app (synthetic / recorded / live serial + experimental panel)
 data/         raw/ processed/ synthetic/ (git-ignored except .gitkeep)
 docs/         architecture, flashing-guide, decision-log, limitations, report-scaffold
-tests/        pytest: parser, features, end-to-end
+tests/        pytest: parser, features, end-to-end, vitals, motion
 ```
 
 ## Setup (Windows)
@@ -76,6 +81,35 @@ Every ML output is labeled **"SYNTHETIC VALIDATION — NOT REAL ACCURACY"** on
 purpose. Synthetic data proves the code works, not that the system is accurate.
 Real numbers come only after collecting real captures.
 
+## Experimental (Phase 5) — vitals + motion
+
+A separate, **explicitly experimental** layer. It is validated against
+synthetic ground truth only and is **not** proven on real ESP32 phase noise.
+Its design principle is *refuse rather than guess*: on short records, dead
+channels, NaNs, or structureless noise it returns **no number** instead of a
+confident wrong one.
+
+```bash
+# Breathing/heart estimate + motion zone on the synthetic still-subject scene
+python -m streamlit run dashboard/app.py    # pick the "still_vitals" scenario,
+                                            # then the Experimental panel
+```
+
+- **Vitals** (`ml/vitals.py`): bandpass (breathing 0.1–0.5 Hz, heart 0.8–2.0 Hz)
+  + FFT peak cross-checked against zero-crossing. On the synthetic still scene it
+  recovers the planted rates; on an empty room it **refuses both bands**.
+  **Breathing** is the only credible target on this hardware. **Heart rate stays
+  untrusted** — 2.4 GHz single-antenna ESP32 lacks the SNR, and the code says so
+  rather than printing a confident lie.
+- **Motion** (`pipeline/motion.py`): per-node signal-disturbance intensity + a
+  coarse "which node's area is livelier" heuristic. **Not** localization, **not**
+  coordinates — it only ever says "node 1 area / node 2 area / uncertain / quiet".
+
+When real boards arrive this layer is **calibration, not code surgery**: measure
+the true packet rate (`sample_rate_hz`), record an empty-room baseline to set
+`quiet_floor` and `min_peak_ratio` in `pipeline/config.py`. See
+[`docs/limitations.md`](docs/limitations.md) for the full honest scope.
+
 ## When the 3 ESP32 boards arrive
 
 Follow [`docs/flashing-guide.md`](docs/flashing-guide.md) exactly. In short:
@@ -107,7 +141,7 @@ subcarriers). Full details and the exact column list in
 - [`docs/architecture.md`](docs/architecture.md) — system, topology, data flow, roadmap (+ Phase 5 vitals note)
 - [`docs/flashing-guide.md`](docs/flashing-guide.md) — exact flashing + verification steps
 - [`docs/decision-log.md`](docs/decision-log.md) — every engineering decision + confirmed schema
-- [`docs/limitations.md`](docs/limitations.md) — honest scope (count ≤ 2, no localization, no vitals)
+- [`docs/limitations.md`](docs/limitations.md) — honest scope (count ≤ 2, no localization, vitals experimental/unvalidated)
 - [`docs/report-scaffold.md`](docs/report-scaffold.md) — college-report skeleton
 
 ## Credits

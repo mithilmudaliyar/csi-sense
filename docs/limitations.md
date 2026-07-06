@@ -37,11 +37,33 @@ optimistic and near-perfect by construction. They say **nothing** about
 real-world accuracy. Every train/eval script prints this warning. Real numbers
 come only after Phases 2–4 with real captures.
 
-## No vitals (breathing / heart rate)
+## Vitals (breathing / heart rate) — EXPERIMENTAL, unvalidated
 
-Breathing- and heart-rate sensing are **out of scope** (noted as a possible
-Phase 5 stretch goal in `architecture.md`). They need higher, steadier
-sampling rates and careful phase processing that this build does not target.
+Phase 5 adds a breathing/heart-rate estimator (`ml/vitals.py`), but treat it as
+a **research spike, not a feature**:
+
+- **Synthetic-only validation.** It recovers rates planted by `ml/synthetic.py`
+  and refuses on an empty room. That proves the DSP path, not real accuracy —
+  the same caveat as every other model here.
+- **Breathing is the only credible band** on commodity single-antenna 2.4 GHz
+  ESP32. **Heart rate is not trusted** on this hardware (SNR too low); the code
+  will report it only when FFT and zero-crossing strongly agree, and otherwise
+  returns nothing.
+- **Refuses rather than guesses.** Short records (< `min_duration_s`), dead
+  channels, NaNs, or structureless noise return **no number**, not a confident
+  wrong one. The gate (`min_peak_ratio`) is a per-room **calibration knob**, not
+  a guarantee — tune it against a real empty-room baseline before trusting any
+  output.
+- Needs higher, steadier sampling and clean phase; do not report a BPM as fact
+  until validated against a real still-subject capture with a reference monitor.
+
+## Motion "zone" is a heuristic, not localization
+
+`pipeline/motion.py` reports per-node **signal-disturbance intensity** and a
+coarse "which node's area is livelier" verdict. It is **not** position, **not**
+coordinates — see *No precise localization* above. The zone call needs per-room
+calibration (`quiet_floor`, node placement) to mean anything and only ever emits
+"node N area / uncertain / quiet".
 
 ## Hardware / signal caveats
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,7 +26,8 @@ from pipeline.parser import CSIFrame
 
 logger = logging.getLogger(__name__)
 
-VALID_LABELS = ("empty", "walking", "fall", "2people", "unlabeled")
+# "still_vitals" = EXPERIMENTAL Phase-5 vitals capture (still subject).
+VALID_LABELS = ("empty", "walking", "fall", "2people", "still_vitals", "unlabeled")
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,8 @@ class SessionMeta:
     n_subcarriers: int
     notes: str = ""
     source: str = "unknown"  # "serial" | "synthetic" | "replay"
+    # Free-form extras (e.g. synthetic ground-truth vitals rates).
+    extra: dict = field(default_factory=dict)
 
 
 def make_session_id(label: str, node_id: str, when: datetime | None = None) -> str:
@@ -87,6 +90,22 @@ def amplitude_matrix(df: pd.DataFrame) -> np.ndarray:
     return df[amp_cols].to_numpy(dtype=np.float32)
 
 
+def phase_matrix(df: pd.DataFrame) -> np.ndarray:
+    """Extract the (n_samples, n_subcarriers) WRAPPED phase matrix.
+
+    Phase is stored wrapped (radians, [-pi, pi]) exactly as the parser
+    produced it. Consumers that need continuity (e.g. the EXPERIMENTAL
+    ml/vitals.py module) must unwrap along time themselves.
+    """
+    ph_cols = sorted(
+        (c for c in df.columns if c.startswith("phase_")),
+        key=lambda c: int(c.split("_")[1]),
+    )
+    if not ph_cols:
+        raise ValueError("DataFrame has no phase_* columns")
+    return df[ph_cols].to_numpy(dtype=np.float32)
+
+
 class SessionWriter:
     """Appends CSI frames to a session file with a metadata sidecar."""
 
@@ -99,6 +118,7 @@ class SessionWriter:
         source: str = "serial",
         sample_rate_hz_nominal: float = 50.0,
         prefer_parquet: bool = False,
+        extra: dict | None = None,
     ) -> None:
         if label not in VALID_LABELS:
             raise ValueError(f"label must be one of {VALID_LABELS}, got {label!r}")
@@ -110,6 +130,7 @@ class SessionWriter:
         self.notes = notes
         self.source = source
         self.sample_rate_hz_nominal = sample_rate_hz_nominal
+        self.extra = dict(extra) if extra else {}
         self._use_parquet = prefer_parquet and _parquet_available()
         self._buffer: list[tuple[float, CSIFrame]] = []
         self._n_written = 0
@@ -167,6 +188,7 @@ class SessionWriter:
             n_subcarriers=self._n_subcarriers or 0,
             notes=self.notes,
             source=self.source,
+            extra=self.extra,
         )
 
     def _write_meta(self) -> None:
