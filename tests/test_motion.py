@@ -17,6 +17,7 @@ from pipeline.motion import (
     ZONE_QUIET,
     ZONE_UNCERTAIN,
     classify_zone,
+    estimate_weighted_position,
     latest_intensities,
     motion_intensity_series,
     normalize_intensities,
@@ -102,3 +103,30 @@ def test_close_nodes_stay_uncertain(default_config):
     # Near-tie below the dominance margin must not commit to a node.
     zone = classify_zone({"node1": 0.50, "node2": 0.48}, default_config)
     assert zone.zone == ZONE_UNCERTAIN
+
+
+def test_position_leans_toward_dominant_node():
+    positions = {"node1": (0.0, 0.0), "node2": (4.0, 0.0)}
+    point = estimate_weighted_position({"node1": 0.9, "node2": 0.1}, positions)
+    assert point is not None
+    x, y = point
+    assert x < 2.0  # closer to node1 than the midpoint
+    assert y == 0.0
+
+
+def test_position_equal_intensity_is_midpoint():
+    positions = {"node1": (0.0, 0.0), "node2": (4.0, 0.0)}
+    x, y = estimate_weighted_position({"node1": 0.5, "node2": 0.5}, positions)
+    assert x == 2.0
+    assert y == 0.0
+
+
+def test_position_zero_intensity_falls_back_to_centroid():
+    positions = {"node1": (0.0, 0.0), "node2": (4.0, 2.0)}
+    x, y = estimate_weighted_position({"node1": 0.0, "node2": 0.0}, positions)
+    assert x == 2.0
+    assert y == 1.0
+
+
+def test_position_needs_two_nodes():
+    assert estimate_weighted_position({"node1": 0.9}, {"node1": (0.0, 0.0)}) is None

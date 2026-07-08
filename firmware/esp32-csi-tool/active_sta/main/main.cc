@@ -2,7 +2,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
-#include "esp_spi_flash.h"
 #include "freertos/event_groups.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -194,5 +193,5 @@ extern "C" void app_main() {
 #endif
 
     xTaskCreatePinnedToCore(&vTask_socket_transmitter_sta_loop, "socket_transmitter_sta_loop",
-                            10000, (void *) &is_wifi_connected, 100, &xHandle, 1);
+                            10000, (void *) &is_wifi_connected, 5, &xHandle, 1);
 }

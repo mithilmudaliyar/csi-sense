@@ -67,7 +67,8 @@ In `menuconfig`:
   - `WiFi SSID` → e.g. **`csi_ap`**  (this is the network the RX nodes join)
   - `WiFi Password` → e.g. **`csipassword`** (>= 8 chars for WPA2)
   - `Should this ESP32 collect and print CSI data?` → **n** (AP only transmits)
-  - `Packet TX Rate` → **100** (packets/sec; RX CSI rate tracks this)
+  - (no `Packet TX Rate` option here — that setting lives on the STA role;
+    each RX board controls its own outgoing rate, see Section 4)
 - **Serial flasher config**
   - `'idf.py monitor' baud rate` → **Custom** → **921600**
 - **Component config → Common ESP32-related**
@@ -102,6 +103,8 @@ In `menuconfig`:
   - `WiFi SSID` → **`csi_ap`** (must match the AP exactly)
   - `WiFi Password` → **`csipassword`** (must match the AP)
   - `Should this ESP32 collect and print CSI data?` → **y**
+  - `Packet TX Rate` → **100** (packets/sec; controls how much traffic this
+    STA generates, which drives its own CSI sample rate)
   - `(Advanced) Should we only collect LLTF?` → **y** (default; gives
     `len=128` → 64 subcarriers, which is what the pipeline + synthetic data
     assume)

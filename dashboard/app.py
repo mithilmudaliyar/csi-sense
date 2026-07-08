@@ -18,6 +18,7 @@ file is a thin presentation layer so the same code serves synthetic and live.
 from __future__ import annotations
 
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,7 @@ from pipeline.motion import (  # noqa: E402
     INTENSITY_CAPTION,
     ZONE_CAPTION,
     classify_zone,
+    estimate_weighted_position,
     latest_intensities,
     motion_intensity_series,
     normalize_intensities,
@@ -246,13 +248,85 @@ def main() -> None:
         st.sidebar.write(f"label: **{meta_label}**, source: {meta.get('source', '?')}")
 
     else:  # Live serial
-        st.sidebar.text_input("COM port", value="COM5")
-        st.sidebar.number_input("Baud", value=921600, step=1)
-        st.warning("Live serial capture activates once an ESP32 RX node is connected. "
-                   "The reader (pipeline.serial_reader.CSISerialReader.open_port) is "
-                   "already implemented and unit-tested against a mock; this panel wires "
-                   "to it on hardware arrival. See docs/flashing-guide.md.")
-        return
+        port = st.sidebar.text_input("COM port (node1)", value="COM5")
+        baud = st.sidebar.number_input("Baud", value=921600, step=1)
+        duration = st.sidebar.slider("Capture duration (s)", 5, 40, 15)
+        st.sidebar.markdown("**Optional: 2nd RX node -> coarse position estimate**")
+        port2 = st.sidebar.text_input("COM port (node2, optional)", value="")
+        pos1 = (
+            st.sidebar.number_input("node1 x (m)", value=0.0, step=0.5),
+            st.sidebar.number_input("node1 y (m)", value=0.0, step=0.5),
+        )
+        pos2 = (
+            st.sidebar.number_input("node2 x (m)", value=4.0, step=0.5),
+            st.sidebar.number_input("node2 y (m)", value=0.0, step=0.5),
+        )
+        if not st.sidebar.button("Capture live"):
+            st.info("Set the COM port/baud for a connected, powered ESP32 RX node "
+                    "(with the AP also powered on) and click 'Capture live'. Fill "
+                    "in a 2nd port + node positions for the coarse position estimate.")
+            return
+        from pipeline.serial_reader import CSISerialReader
+
+        def _capture(port_name: str, baud_rate: int, n_frames: int, out: dict, key: str) -> None:
+            try:
+                reader = CSISerialReader.open_port(port_name, baudrate=baud_rate)
+                frames = [f for _, f in reader.frames(max_frames=n_frames)]
+                out[key] = {"frames": frames, "malformed": reader.n_malformed, "error": None}
+            except Exception as exc:  # pragma: no cover - hardware-dependent UI path
+                out[key] = {"frames": None, "malformed": 0, "error": str(exc)}
+
+        max_frames = int(duration * sr)
+        results: dict = {}
+        threads = [threading.Thread(target=_capture, args=(port, int(baud), max_frames, results, "node1"))]
+        if port2.strip():
+            threads.append(threading.Thread(
+                target=_capture, args=(port2.strip(), int(baud), max_frames, results, "node2")))
+        with st.spinner(f"Capturing {duration}s..."):
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        r1 = results["node1"]
+        if not r1["frames"]:
+            st.error(f"No CSI frames from node1 ({port}): {r1['error'] or 'check hardware'}")
+            return
+        st.sidebar.success(f"node1: {len(r1['frames'])} frames ({r1['malformed']} malformed skipped)")
+        amp = np.vstack([f.amplitude for f in r1["frames"]]).astype(np.float32)
+        live_phase = np.vstack([f.phase for f in r1["frames"]]).astype(np.float32)
+        meta_label = "live"
+
+        if "node2" in results:
+            r2 = results["node2"]
+            if not r2["frames"]:
+                st.warning(f"node2 ({port2}) gave no frames: {r2['error'] or 'check hardware'} "
+                          "— showing node1 data only, no position estimate.")
+            else:
+                st.sidebar.success(f"node2: {len(r2['frames'])} frames ({r2['malformed']} malformed skipped)")
+                amp2 = np.vstack([f.amplitude for f in r2["frames"]]).astype(np.float32)
+                intens = {
+                    "node1": motion_intensity_series(preprocess(amp, config), config, node_id="node1"),
+                    "node2": motion_intensity_series(preprocess(amp2, config), config, node_id="node2"),
+                }
+                latest = latest_intensities(intens, column="intensity")
+                point = estimate_weighted_position(latest, {"node1": pos1, "node2": pos2})
+                st.subheader("📍 Coarse position estimate — EXPERIMENTAL")
+                st.caption("Intensity-weighted lean between the two nodes. NOT a "
+                          "calibrated coordinate system — no AoA/ToF data exists on "
+                          "this hardware for real triangulation. Treat as 'closer to "
+                          "which node', continuous instead of categorical.")
+                if point is None:
+                    st.info("Not enough data to estimate a position.")
+                else:
+                    plot_df = pd.DataFrame(
+                        [
+                            {"x": pos1[0], "y": pos1[1], "label": "node1"},
+                            {"x": pos2[0], "y": pos2[1], "label": "node2"},
+                            {"x": point[0], "y": point[1], "label": "estimated position"},
+                        ]
+                    )
+                    st.scatter_chart(plot_df, x="x", y="y", color="label", height=300)
 
     if amp is None or amp.size == 0:
         st.error("No CSI data to display.")
@@ -296,9 +370,15 @@ def main() -> None:
         motion_sc = scenario if scenario != "still_vitals" else "walking"
         amp_by_node = _synthetic_two_node(motion_sc, float(duration), sr, int(seed), "node1")
         _motion_panel(amp_by_node, config)
-    else:  # Recorded single-node capture: vitals only (zone needs 2 nodes).
+    else:  # Recorded / Live single-node capture: vitals only (zone needs 2 nodes).
         try:
-            _vitals_panel(phase_matrix(df), sr, (meta.get("extra") or {}).get("ground_truth"))
+            if source == "Recorded session":
+                phase = phase_matrix(df)
+                gt = (meta.get("extra") or {}).get("ground_truth")
+            else:
+                phase = live_phase
+                gt = None
+            _vitals_panel(phase, sr, gt)
         except ValueError:
             st.info("This session has no phase columns — vitals need phase CSI.")
         st.caption("Coarse-zone needs ≥2 RX nodes; unavailable for one recorded node.")

@@ -110,6 +110,32 @@ def latest_intensities(
     }
 
 
+def estimate_weighted_position(
+    intensities: Mapping[str, float],
+    node_positions: Mapping[str, tuple[float, float]],
+) -> tuple[float, float] | None:
+    """Intensity-weighted centroid across node (x, y) positions.
+
+    EXPERIMENTAL, same honesty rules as ``classify_zone``: nodes seeing MORE
+    disturbance pull the estimate toward them. This is a continuous version
+    of the zone heuristic, NOT a calibrated coordinate system — no
+    angle-of-arrival or time-of-flight data exists on this hardware to
+    support real triangulation. Needs >=2 nodes reporting; returns None
+    otherwise. If no node has any measurable disturbance, returns the plain
+    (unweighted) centroid rather than an arbitrary corner.
+    """
+    nodes = [n for n in node_positions if n in intensities]
+    if len(nodes) < 2:
+        return None
+    weights = np.array([max(intensities[n], 0.0) for n in nodes], dtype=float)
+    if weights.sum() <= 1e-12:
+        weights = np.ones(len(nodes))
+    weights = weights / weights.sum()
+    pts = np.array([node_positions[n] for n in nodes], dtype=float)
+    point = (pts * weights[:, None]).sum(axis=0)
+    return float(point[0]), float(point[1])
+
+
 def classify_zone(
     intensities: Mapping[str, float],
     config: PipelineConfig,
